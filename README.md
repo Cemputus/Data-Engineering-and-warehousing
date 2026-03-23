@@ -1,4 +1,4 @@
-# Data Engineering and Warehousing (Group Work)
+# Data Engineering and Warehousing
 
 This project demonstrates a **three-layer data warehouse architecture** implemented with a practical **ETL pipeline** using:
 - **PostgreSQL** (running in Docker)
