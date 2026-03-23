@@ -1,6 +1,9 @@
 import os
 import sys
 import time
+import json
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -18,6 +21,10 @@ class Settings:
 
     occupazione_csv: str
     disoccupazione_csv: str
+
+    api_url: str = "https://www.apicountries.com/countries"
+    api_timeout_seconds: int = 20
+    api_fetch_retries: int = 3
 
     # Schemas implementing the three-layer architecture
     ingestion_schema: str = "ingestion"
@@ -45,6 +52,9 @@ def load_settings() -> Settings:
         db_password=getenv_required("DB_PASSWORD"),
         occupazione_csv=os.getenv("OCCUPAZIONE_CSV", "/app/occupazione.csv"),
         disoccupazione_csv=os.getenv("DISOCCUPAZIONE_CSV", "/app/disoccupazione.csv"),
+        api_url=os.getenv("API_URL", "https://www.apicountries.com/countries"),
+        api_timeout_seconds=int(os.getenv("API_TIMEOUT_SECONDS", "20")),
+        api_fetch_retries=int(os.getenv("API_FETCH_RETRIES", "3")),
     )
 
 
@@ -121,6 +131,17 @@ def ensure_tables(conn: PGConnection, settings: Settings) -> None:
             obs_value TEXT,
             loaded_at TIMESTAMP DEFAULT NOW()
         );
+
+        -- Population API raw landing table.
+        -- Source JSON fields (example):
+        --   alpha3Code (-> iso_code), name (-> country), population (-> population)
+        CREATE TABLE IF NOT EXISTS {settings.ingestion_schema}.population_raw (
+            iso_code TEXT NOT NULL,
+            country TEXT NOT NULL,
+            population BIGINT NOT NULL,
+            api_loaded_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (iso_code)
+        );
         """,
     )
 
@@ -148,6 +169,16 @@ def ensure_tables(conn: PGConnection, settings: Settings) -> None:
             unemployment_rate NUMERIC(10, 3) NOT NULL,
             etl_loaded_at TIMESTAMP DEFAULT NOW(),
             UNIQUE (iso_code, sex, age, year)
+        );
+
+        -- Population API staging:
+        -- Converts population to a typed numeric type for joins/derived metrics.
+        CREATE TABLE IF NOT EXISTS {settings.staging_schema}.population_stg (
+            iso_code TEXT NOT NULL,
+            country TEXT NOT NULL,
+            population BIGINT NOT NULL,
+            etl_loaded_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (iso_code)
         );
         """,
     )
@@ -188,6 +219,36 @@ def ensure_tables(conn: PGConnection, settings: Settings) -> None:
             etl_loaded_at TIMESTAMP DEFAULT NOW(),
             UNIQUE (iso_code, year)
         );
+
+        -- Population dimension-like snapshot stored in the mart for analysis.
+        CREATE TABLE IF NOT EXISTS {settings.mart_schema}.country_population (
+            iso_code TEXT NOT NULL,
+            country TEXT NOT NULL,
+            population BIGINT NOT NULL,
+            snapshot_loaded_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (iso_code)
+        );
+
+        -- Joined mart slice to compare unemployment/employment rates against population.
+        -- Estimates absolute counts using: persons = population * rate / 100.
+        CREATE TABLE IF NOT EXISTS {settings.mart_schema}.country_year_total_15plus_with_population (
+            iso_code TEXT NOT NULL,
+            country TEXT NOT NULL,
+            year INT NOT NULL,
+            population BIGINT NOT NULL,
+
+            employment_rate_15plus_total NUMERIC(10, 3) NOT NULL,
+            unemployment_rate_15plus_total NUMERIC(10, 3) NOT NULL,
+
+            unemployment_to_employment_ratio NUMERIC(12, 6),
+            unemployment_minus_employment NUMERIC(10, 3),
+
+            employment_persons_est NUMERIC(22, 2),
+            unemployment_persons_est NUMERIC(22, 2),
+
+            etl_loaded_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (iso_code, year)
+        );
         """,
     )
 
@@ -207,6 +268,11 @@ def truncate_tables(conn: PGConnection, settings: Settings) -> None:
 
     exec_sql(conn, f"TRUNCATE TABLE {settings.mart_schema}.country_year_sex_age_rates;")
     exec_sql(conn, f"TRUNCATE TABLE {settings.mart_schema}.country_year_total_15plus;")
+
+    exec_sql(conn, f"TRUNCATE TABLE {settings.ingestion_schema}.population_raw;")
+    exec_sql(conn, f"TRUNCATE TABLE {settings.staging_schema}.population_stg;")
+    exec_sql(conn, f"TRUNCATE TABLE {settings.mart_schema}.country_population;")
+    exec_sql(conn, f"TRUNCATE TABLE {settings.mart_schema}.country_year_total_15plus_with_population;")
 
 
 def copy_csv_to_table(
@@ -320,6 +386,175 @@ def seed_staging(conn: PGConnection, settings: Settings) -> None:
     )
 
 
+def fetch_population_api(settings: Settings) -> list[dict]:
+    """
+    Fetches population data from the configured API endpoint.
+
+    Expected JSON object structure (based on live response preview):
+    - `alpha3Code` -> iso_code (matches CSV `iso_code` values like "AFG")
+    - `name` -> country
+    - `population` -> integer population value
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, settings.api_fetch_retries + 1):
+        try:
+            req = urllib.request.Request(
+                settings.api_url,
+                headers={"User-Agent": "Mozilla/5.0 (etl_pipeline; +python)"},
+            )
+            with urllib.request.urlopen(req, timeout=settings.api_timeout_seconds) as resp:
+                raw = resp.read()
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, list):
+                raise RuntimeError(f"Unexpected API payload type: {type(payload)}")
+            return payload
+        except Exception as exc:  # noqa: BLE001 - demo script
+            last_exc = exc
+            print(
+                f"[WARN] Population API fetch failed (attempt {attempt}/{settings.api_fetch_retries}): {exc!r}",
+                file=sys.stderr,
+            )
+            time.sleep(1.0)
+    raise RuntimeError(f"Could not fetch population API after retries: {last_exc!r}")
+
+
+def seed_population_ingestion(conn: PGConnection, settings: Settings) -> None:
+    """
+    Ingestion layer implementation (new third source):
+    - Calls `API_URL` and loads the response into `ingestion.population_raw`.
+    - Stores only normalized fields:
+        * iso_code, country, population
+    """
+    payload = fetch_population_api(settings)
+
+    rows: list[tuple[str, str, int]] = []
+    for item in payload:
+        iso_code = item.get("alpha3Code")
+        country = item.get("name")
+        population = item.get("population")
+
+        if not iso_code or not country or population is None:
+            continue
+
+        try:
+            population_int = int(population)
+        except Exception:
+            continue
+
+        if population_int <= 0:
+            continue
+
+        rows.append((str(iso_code), str(country), population_int))
+
+    if not rows:
+        raise RuntimeError("Population API returned no valid rows to load.")
+
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"""
+            INSERT INTO {settings.ingestion_schema}.population_raw (iso_code, country, population)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (iso_code) DO UPDATE
+            SET country = EXCLUDED.country,
+                population = EXCLUDED.population,
+                api_loaded_at = NOW();
+            """,
+            rows,
+        )
+
+
+def seed_population_staging(conn: PGConnection, settings: Settings) -> None:
+    """
+    Staging layer implementation (population):
+    - Filters/validates `iso_code` shape and population positivity
+    - Casts into a typed model stored in `staging.population_stg`
+    """
+    exec_sql(
+        conn,
+        f"""
+        INSERT INTO {settings.staging_schema}.population_stg (iso_code, country, population)
+        SELECT
+            iso_code,
+            country,
+            population::bigint
+        FROM {settings.ingestion_schema}.population_raw
+        WHERE
+            iso_code ~ '^[A-Z]{{3}}$'
+            AND population::bigint > 0
+        ON CONFLICT (iso_code) DO UPDATE
+        SET
+            country = EXCLUDED.country,
+            population = EXCLUDED.population,
+            etl_loaded_at = NOW();
+        """,
+    )
+
+
+def seed_population_mart(conn: PGConnection, settings: Settings) -> None:
+    """
+    Mart layer implementation (population + rate-to-count comparison):
+
+    1) `mart.country_population`
+       - A snapshot/dimension-like table mapping iso_code -> population.
+
+    2) `mart.country_year_total_15plus_with_population`
+       - Joins the rate slice (`mart.country_year_total_15plus`) with population.
+       - Derives absolute estimated counts:
+           employment_persons_est  = population * employment_rate / 100
+           unemployment_persons_est = population * unemployment_rate / 100
+       - Enables ranking by the number of unemployed persons (population-aware).
+    """
+    exec_sql(
+        conn,
+        f"""
+        INSERT INTO {settings.mart_schema}.country_population (iso_code, country, population)
+        SELECT iso_code, country, population
+        FROM {settings.staging_schema}.population_stg
+        ON CONFLICT (iso_code) DO UPDATE
+        SET
+            country = EXCLUDED.country,
+            population = EXCLUDED.population,
+            snapshot_loaded_at = NOW();
+        """,
+    )
+
+    exec_sql(
+        conn,
+        f"""
+        INSERT INTO {settings.mart_schema}.country_year_total_15plus_with_population (
+            iso_code, country, year, population,
+            employment_rate_15plus_total, unemployment_rate_15plus_total,
+            unemployment_to_employment_ratio, unemployment_minus_employment,
+            employment_persons_est, unemployment_persons_est
+        )
+        SELECT
+            t.iso_code,
+            t.country,
+            t.year,
+            p.population,
+            t.employment_rate_15plus_total,
+            t.unemployment_rate_15plus_total,
+            t.unemployment_to_employment_ratio,
+            t.unemployment_minus_employment,
+            (p.population::numeric * t.employment_rate_15plus_total / 100)::numeric(22,2) AS employment_persons_est,
+            (p.population::numeric * t.unemployment_rate_15plus_total / 100)::numeric(22,2) AS unemployment_persons_est
+        FROM {settings.mart_schema}.country_year_total_15plus t
+        JOIN {settings.mart_schema}.country_population p
+          ON p.iso_code = t.iso_code
+        ON CONFLICT (iso_code, year) DO UPDATE
+        SET
+            population = EXCLUDED.population,
+            employment_rate_15plus_total = EXCLUDED.employment_rate_15plus_total,
+            unemployment_rate_15plus_total = EXCLUDED.unemployment_rate_15plus_total,
+            unemployment_to_employment_ratio = EXCLUDED.unemployment_to_employment_ratio,
+            unemployment_minus_employment = EXCLUDED.unemployment_minus_employment,
+            employment_persons_est = EXCLUDED.employment_persons_est,
+            unemployment_persons_est = EXCLUDED.unemployment_persons_est,
+            etl_loaded_at = NOW();
+        """,
+    )
+
+
 def seed_mart(conn: PGConnection, settings: Settings) -> None:
     """
     Mart layer implementation:
@@ -403,10 +638,23 @@ def create_indexes(conn: PGConnection, settings: Settings) -> None:
         CREATE INDEX IF NOT EXISTS idx_disoccupazione_stg_keys
             ON {settings.staging_schema}.disoccupazione_stg (iso_code, sex, age, year);
 
+        -- Population staging indexes (API -> typed model)
+        CREATE INDEX IF NOT EXISTS idx_population_stg_iso
+            ON {settings.staging_schema}.population_stg (iso_code);
+        CREATE INDEX IF NOT EXISTS idx_population_stg_population
+            ON {settings.staging_schema}.population_stg (population);
+
         CREATE INDEX IF NOT EXISTS idx_mart_country_year_sex_age
             ON {settings.mart_schema}.country_year_sex_age_rates (country, year, sex, age);
         CREATE INDEX IF NOT EXISTS idx_mart_total_15plus
             ON {settings.mart_schema}.country_year_total_15plus (country, year);
+
+        CREATE INDEX IF NOT EXISTS idx_mart_country_population_iso
+            ON {settings.mart_schema}.country_population (iso_code);
+        CREATE INDEX IF NOT EXISTS idx_mart_total_15plus_with_population_year
+            ON {settings.mart_schema}.country_year_total_15plus_with_population (year, population);
+        CREATE INDEX IF NOT EXISTS idx_mart_total_15plus_with_population_iso_year
+            ON {settings.mart_schema}.country_year_total_15plus_with_population (iso_code, year);
         """,
     )
 
@@ -454,6 +702,33 @@ def main() -> None:
             conn, f"SELECT COUNT(*) FROM {settings.mart_schema}.country_year_total_15plus;"
         )
         print(f"[INFO] Mart rows: country_year_sex_age_rates={mart_rows}, total_15plus={mart_total_rows}")
+
+        print("[INFO] Building population ingestion layer from API...")
+        seed_population_ingestion(conn, settings)
+        pop_ingested = fetch_one_value(
+            conn, f"SELECT COUNT(*) FROM {settings.ingestion_schema}.population_raw;"
+        )
+        print(f"[INFO] Population rows (ingestion): {pop_ingested}")
+
+        print("[INFO] Building population staging layer (validate/cast)...")
+        seed_population_staging(conn, settings)
+        pop_staged = fetch_one_value(
+            conn, f"SELECT COUNT(*) FROM {settings.staging_schema}.population_stg;"
+        )
+        print(f"[INFO] Population rows (staging): {pop_staged}")
+
+        print("[INFO] Building population mart join (rates -> counts)...")
+        seed_population_mart(conn, settings)
+        pop_mart_rows = fetch_one_value(
+            conn, f"SELECT COUNT(*) FROM {settings.mart_schema}.country_year_total_15plus_with_population;"
+        )
+        country_pop_rows = fetch_one_value(
+            conn, f"SELECT COUNT(*) FROM {settings.mart_schema}.country_population;"
+        )
+        print(
+            f"[INFO] Population mart rows: country_population={country_pop_rows}, "
+            f"total_15plus_with_population={pop_mart_rows}"
+        )
 
         print("[INFO] Creating indexes (performance)...")
         create_indexes(conn, settings)

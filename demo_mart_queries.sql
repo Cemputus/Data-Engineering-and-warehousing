@@ -2,6 +2,8 @@
 -- Mart schemas/tables created by `etl_pipeline.py`:
 --   mart.country_year_sex_age_rates
 --   mart.country_year_total_15plus
+--   mart.country_population
+--   mart.country_year_total_15plus_with_population
 --
 -- Connection tip: connect to the same Postgres DB used by Docker (DB_NAME=de_wh).
 
@@ -192,4 +194,70 @@ FROM mart.country_year_total_15plus t
 JOIN latest_year ly ON ly.y = t.year
 ORDER BY t.unemployment_minus_employment DESC
 LIMIT 10;
+
+-- 15) Population-related sanity checks (API -> mart snapshot)
+SELECT
+  (SELECT COUNT(*) FROM mart.country_population) AS country_population_rows,
+  (SELECT COUNT(*) FROM mart.country_year_total_15plus_with_population) AS total_15plus_with_population_rows;
+
+-- 16) Latest-year Top 10 by population (shows unemployment rate)
+WITH latest_year AS (
+  SELECT MAX(year) AS y
+  FROM mart.country_year_total_15plus_with_population
+)
+SELECT
+  t.iso_code,
+  t.country,
+  t.year,
+  t.population,
+  t.unemployment_rate_15plus_total,
+  t.employment_rate_15plus_total
+FROM mart.country_year_total_15plus_with_population t
+JOIN latest_year ly ON ly.y = t.year
+ORDER BY t.population DESC
+LIMIT 10;
+
+-- 17) Latest-year Top 10 by estimated number of unemployed persons (population-aware)
+WITH latest_year AS (
+  SELECT MAX(year) AS y
+  FROM mart.country_year_total_15plus_with_population
+)
+SELECT
+  t.iso_code,
+  t.country,
+  t.year,
+  t.population,
+  t.unemployment_rate_15plus_total,
+  t.unemployment_persons_est
+FROM mart.country_year_total_15plus_with_population t
+JOIN latest_year ly ON ly.y = t.year
+ORDER BY t.unemployment_persons_est DESC
+LIMIT 10;
+
+-- 18) Trend: total estimated unemployed persons across all countries per year
+SELECT
+  year,
+  SUM(unemployment_persons_est) AS total_unemployed_persons_est
+FROM mart.country_year_total_15plus_with_population
+GROUP BY year
+ORDER BY year;
+
+-- 19) Latest-year: unemployment rate by population quartile
+WITH latest_year AS (
+  SELECT MAX(year) AS y
+  FROM mart.country_year_total_15plus_with_population
+),
+base AS (
+  SELECT
+    NTILE(4) OVER (ORDER BY t.population) AS pop_quartile,
+    t.unemployment_rate_15plus_total
+  FROM mart.country_year_total_15plus_with_population t
+  JOIN latest_year ly ON ly.y = t.year
+)
+SELECT
+  pop_quartile,
+  AVG(unemployment_rate_15plus_total) AS avg_unemployment_rate
+FROM base
+GROUP BY pop_quartile
+ORDER BY pop_quartile;
 

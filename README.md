@@ -24,9 +24,22 @@ Both CSV files share the same schema:
 - `year` (int-like)
 - `obs_value` (numeric-like, expressed as a percentage)
 
+### Data Source
+The dataset used for `occupazione.csv` and `disoccupazione.csv` is sourced from Kaggle:
+- https://www.kaggle.com/datasets/lucalullo/global-employment-unemployment-rates-1991-2025
+
 Files:
 - `occupazione.csv` → **employment_rate**
 - `disoccupazione.csv` → **unemployment_rate**
+
+### Additional Data Source (Population API)
+To broaden the analysis, the ETL also consumes a country population API:
+- `API_URL`: `https://www.apicountries.com/countries`
+
+The API returns a list of countries as JSON. The ETL maps these fields to your warehouse model:
+- `alpha3Code` → `iso_code` (matches the Kaggle CSV `iso_code` values like `AFG`)
+- `name` → `country`
+- `population` → `population` (used to estimate employment/unemployment *counts*)
 
 ### Dataset assumptions
 
@@ -50,6 +63,7 @@ Role:
 Tables:
 - `ingestion.occupazione_raw`
 - `ingestion.disoccupazione_raw`
+- `ingestion.population_raw`
 
 Characteristics:
 - No business logic applied besides storing the data
@@ -65,6 +79,7 @@ Role:
 Tables:
 - `staging.occupazione_stg`
 - `staging.disoccupazione_stg`
+- `staging.population_stg`
 
 Transformations:
 - `year` cast to `INT`
@@ -99,6 +114,12 @@ Tables:
 - `mart.country_year_total_15plus`
   - Convenience slice for:
     - `sex='Total'` and `age='15+'`
+- `mart.country_population`
+  - Population snapshot mapped by `iso_code`
+- `mart.country_year_total_15plus_with_population`
+  - Population-aware slice that estimates unemployed/employed persons:
+    - `unemployment_persons_est = population * unemployment_rate / 100`
+    - `employment_persons_est = population * employment_rate / 100`
 
 Derived metrics:
 - `unemployment_to_employment_ratio`
@@ -161,12 +182,20 @@ If you already have the ETL image built, you can run without rebuilding:
 docker compose up --abort-on-container-exit etl
 ```
 
-### 5.2 Start only PostgreSQL (optional)
+### 5.2 Configuration (override API endpoint)
+The population API endpoint can be overridden via environment variables (used by `etl_pipeline.py`):
+- `API_URL` (default: `https://www.apicountries.com/countries`)
+- `API_TIMEOUT_SECONDS` (default: `20`)
+- `API_FETCH_RETRIES` (default: `3`)
+
+If you want to change the API URL, set these environment variables before running Docker (for example by editing `docker-compose.yml` or using your shell’s environment variables).
+
+### 5.3 Start only PostgreSQL (optional)
 ```powershell
 docker compose up -d postgres
 ```
 
-### 5.3 Common workflow
+### 5.4 Common workflow
 1) Start PostgreSQL:
 ```powershell
 docker compose up -d postgres
@@ -214,6 +243,8 @@ Run:
 ```sql
 SELECT COUNT(*) FROM mart.country_year_total_15plus;
 SELECT COUNT(*) FROM mart.country_year_sex_age_rates;
+SELECT COUNT(*) FROM mart.country_year_total_15plus_with_population;
+SELECT COUNT(*) FROM mart.country_population;
 ```
 
 If counts exist and match expected ranges, the pipeline is working.
@@ -227,6 +258,7 @@ This script includes:
 - record-per-year counts
 - trend averages across years
 - multiple top-10 rankings for the latest year
+- population-aware top-10 ranking (estimated unemployed persons) for the latest year
 - an example time-series for Afghanistan (`AFG`)
 
 ---
@@ -256,6 +288,7 @@ Recommended captures:
 2. Screenshot showing validation counts from mart:
    - total 15+ slice
    - main joined fact table
+   - population-aware 15+ slice
 3. Screenshot showing one top-10 ranking query result
 4. Screenshot showing one trend query result (averages over years)
 
