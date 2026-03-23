@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: de_warehouse_postgres
+    environment:
+      POSTGRES_USER: de_user
+      POSTGRES_PASSWORD: de_pass
+      POSTGRES_DB: de_wh
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  etl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - postgres
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: de_wh
+      DB_USER: de_user
+      DB_PASSWORD: de_pass
+      OCCUPAZIONE_CSV: /app/occupazione.csv
+      DISOCCUPAZIONE_CSV: /app/disoccupazione.csv
+    # Run once and exit (the pipeline is idempotent by truncating the target tables).
+    restart: "no"
+
+volumes:
+  pgdata:
+
