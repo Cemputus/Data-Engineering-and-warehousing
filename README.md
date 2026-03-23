@@ -3,9 +3,10 @@
 This project demonstrates a **three-layer data warehouse architecture** implemented with a practical **ETL pipeline** using:
 - **PostgreSQL** (running in Docker)
 - A Python ETL runner (`etl_pipeline.py`)
-- Two provided CSV datasets:
+- Two provided CSV datasets and one external API source:
   - `occupazione.csv` (employment rates)
   - `disoccupazione.csv` (unemployment rates)
+  - Population API: https://www.apicountries.com/countries
 
 The warehouse layers are implemented as PostgreSQL schemas:
 - `ingestion` = raw landing data (TEXT)
