@@ -1,0 +1,9 @@
+# PDFs / assignment documents
+"Data Engineering and Warehousing  Group Work (1).pdf"
+"Dataset-Discription.pdf"
+
+# ETL artifacts (optional safety)
+.env
+__pycache__/
+*.pyc
+
