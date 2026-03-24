@@ -5,10 +5,10 @@ import json
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
-import psycopg2  # type: ignore[reportMissingImports]
-from psycopg2.extensions import connection as PGConnection  # type: ignore[reportMissingImports]
+import psycopg2  
+from psycopg2.extensions import connection as PGConnection  
 
 
 @dataclass(frozen=True)
@@ -50,8 +50,8 @@ def load_settings() -> Settings:
         db_name=getenv_required("DB_NAME"),
         db_user=getenv_required("DB_USER"),
         db_password=getenv_required("DB_PASSWORD"),
-        occupazione_csv=os.getenv("OCCUPAZIONE_CSV", "/app/occupazione.csv"),
-        disoccupazione_csv=os.getenv("DISOCCUPAZIONE_CSV", "/app/disoccupazione.csv"),
+        occupazione_csv=os.getenv("OCCUPAZIONE_CSV", "/app/Dataset/occupazione.csv"),
+        disoccupazione_csv=os.getenv("DISOCCUPAZIONE_CSV", "/app/Dataset/disoccupazione.csv"),
         api_url=os.getenv("API_URL", "https://www.apicountries.com/countries"),
         api_timeout_seconds=int(os.getenv("API_TIMEOUT_SECONDS", "20")),
         api_fetch_retries=int(os.getenv("API_FETCH_RETRIES", "3")),
@@ -92,6 +92,17 @@ def fetch_one_value(conn: PGConnection, sql: str) -> int:
     if not row:
         return 0
     return int(row[0])
+
+
+def fetch_two_values(conn: PGConnection, sql: str) -> Tuple[int, int]:
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        row = cur.fetchone()
+    if not row:
+        return 0, 0
+    left = 0 if row[0] is None else int(row[0])
+    right = 0 if row[1] is None else int(row[1])
+    return left, right
 
 
 def ensure_schemas(conn: PGConnection, schemas: Sequence[str]) -> None:
@@ -248,6 +259,20 @@ def ensure_tables(conn: PGConnection, settings: Settings) -> None:
 
             etl_loaded_at TIMESTAMP DEFAULT NOW(),
             UNIQUE (iso_code, year)
+        );
+
+        -- Source-level run audit table to detect row/content changes between ETL runs.
+        CREATE TABLE IF NOT EXISTS {settings.mart_schema}.etl_source_audit (
+            source_name TEXT NOT NULL,
+            observed_rows BIGINT NOT NULL,
+            observed_fingerprint BIGINT NOT NULL,
+            previous_rows BIGINT,
+            previous_fingerprint BIGINT,
+            delta_rows BIGINT,
+            new_rows BIGINT,
+            removed_rows BIGINT,
+            change_type TEXT NOT NULL,
+            observed_at TIMESTAMP DEFAULT NOW()
         );
         """,
     )
@@ -555,6 +580,151 @@ def seed_population_mart(conn: PGConnection, settings: Settings) -> None:
     )
 
 
+def audit_source_snapshot(
+    conn: PGConnection,
+    settings: Settings,
+    source_name: str,
+    observed_rows: int,
+    observed_fingerprint: int,
+) -> None:
+    """
+    Persists per-source audit metrics and logs whether data changed.
+
+    Change detection logic:
+    - first_load: no previous snapshot for this source
+    - unchanged: rows and fingerprint unchanged
+    - row_count_changed: row count differs
+    - content_changed_same_count: row count same but fingerprint differs
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT observed_rows, observed_fingerprint
+            FROM {settings.mart_schema}.etl_source_audit
+            WHERE source_name = %s
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            (source_name,),
+        )
+        prev = cur.fetchone()
+
+    if prev is None:
+        previous_rows = None
+        previous_fingerprint = None
+        delta_rows = None
+        new_rows = observed_rows
+        removed_rows = 0
+        change_type = "first_load"
+    else:
+        previous_rows = int(prev[0])
+        previous_fingerprint = int(prev[1])
+        delta_rows = observed_rows - previous_rows
+        new_rows = delta_rows if delta_rows > 0 else 0
+        removed_rows = -delta_rows if delta_rows < 0 else 0
+        if delta_rows != 0:
+            change_type = "row_count_changed"
+        elif observed_fingerprint != previous_fingerprint:
+            change_type = "content_changed_same_count"
+        else:
+            change_type = "unchanged"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {settings.mart_schema}.etl_source_audit
+                (source_name, observed_rows, observed_fingerprint,
+                 previous_rows, previous_fingerprint,
+                 delta_rows, new_rows, removed_rows, change_type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                source_name,
+                observed_rows,
+                observed_fingerprint,
+                previous_rows,
+                previous_fingerprint,
+                delta_rows,
+                new_rows,
+                removed_rows,
+                change_type,
+            ),
+        )
+
+    print(
+        "[AUDIT] "
+        f"source={source_name} "
+        f"rows={observed_rows} "
+        f"prev_rows={previous_rows if previous_rows is not None else 'n/a'} "
+        f"delta_rows={delta_rows if delta_rows is not None else 'n/a'} "
+        f"new_rows={new_rows} "
+        f"removed_rows={removed_rows} "
+        f"status={change_type}"
+    )
+
+
+def run_source_audit(conn: PGConnection, settings: Settings) -> None:
+    """
+    Computes source snapshots from ingestion tables and writes audit rows.
+    """
+    occup_rows, occup_fp = fetch_two_values(
+        conn,
+        f"""
+        SELECT
+            COUNT(*)::bigint AS cnt,
+            COALESCE(
+                bit_xor(
+                    hashtextextended(
+                        concat_ws('|', iso_code, country, sex, age, year, obs_value),
+                        0
+                    )
+                ),
+                0
+            )::bigint AS fp
+        FROM {settings.ingestion_schema}.occupazione_raw
+        """,
+    )
+    audit_source_snapshot(conn, settings, "occupazione_csv", occup_rows, occup_fp)
+
+    disoc_rows, disoc_fp = fetch_two_values(
+        conn,
+        f"""
+        SELECT
+            COUNT(*)::bigint AS cnt,
+            COALESCE(
+                bit_xor(
+                    hashtextextended(
+                        concat_ws('|', iso_code, country, sex, age, year, obs_value),
+                        0
+                    )
+                ),
+                0
+            )::bigint AS fp
+        FROM {settings.ingestion_schema}.disoccupazione_raw
+        """,
+    )
+    audit_source_snapshot(conn, settings, "disoccupazione_csv", disoc_rows, disoc_fp)
+
+    pop_rows, pop_fp = fetch_two_values(
+        conn,
+        f"""
+        SELECT
+            COUNT(*)::bigint AS cnt,
+            COALESCE(
+                bit_xor(
+                    hashtextextended(
+                        concat_ws('|', iso_code, country, population::text),
+                        0
+                    )
+                ),
+                0
+            )::bigint AS fp
+        FROM {settings.ingestion_schema}.population_raw
+        """,
+    )
+    audit_source_snapshot(conn, settings, "population_api", pop_rows, pop_fp)
+
+
 def seed_mart(conn: PGConnection, settings: Settings) -> None:
     """
     Mart layer implementation:
@@ -709,6 +879,9 @@ def main() -> None:
             conn, f"SELECT COUNT(*) FROM {settings.ingestion_schema}.population_raw;"
         )
         print(f"[INFO] Population rows (ingestion): {pop_ingested}")
+
+        print("[INFO] Auditing source changes (new/removed/content-changed rows)...")
+        run_source_audit(conn, settings)
 
         print("[INFO] Building population staging layer (validate/cast)...")
         seed_population_staging(conn, settings)

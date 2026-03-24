@@ -4,8 +4,8 @@ This project demonstrates a **three-layer data warehouse architecture** implemen
 - **PostgreSQL** (running in Docker)
 - A Python ETL runner (`etl_pipeline.py`)
 - Two provided CSV datasets and one external API source:
-  - `occupazione.csv` (employment rates)
-  - `disoccupazione.csv` (unemployment rates)
+  - `Dataset/occupazione.csv` (employment rates)
+  - `Dataset/disoccupazione.csv` (unemployment rates)
   - Population API: https://www.apicountries.com/countries
 
 The warehouse layers are implemented as PostgreSQL schemas:
@@ -26,12 +26,12 @@ Both CSV files share the same schema:
 - `obs_value` (numeric-like, expressed as a percentage)
 
 ### Data Source
-The dataset used for `occupazione.csv` and `disoccupazione.csv` is sourced from Kaggle:
+The dataset used for `Dataset/occupazione.csv` and `Dataset/disoccupazione.csv` is sourced from Kaggle:
 - https://www.kaggle.com/datasets/lucalullo/global-employment-unemployment-rates-1991-2025
 
 Files:
-- `occupazione.csv` → **employment_rate**
-- `disoccupazione.csv` → **unemployment_rate**
+- `Dataset/occupazione.csv` → **employment_rate**
+- `Dataset/disoccupazione.csv` → **unemployment_rate**
 
 ### Additional Data Source (Population API)
 To broaden the analysis, the ETL also consumes a country population API:
@@ -147,8 +147,10 @@ Idempotency handling:
   - A DBeaver-friendly SQL script with demo queries (counts, trends, top-10 rankings)
 
 Datasets:
-- `occupazione.csv`
-- `disoccupazione.csv`
+- `Dataset/occupazione.csv`
+- `Dataset/disoccupazione.csv`
+- `Dataset/Dataset-Discription.md`
+- `Dataset/Dataset-Discription.pdf`
 
 ---
 

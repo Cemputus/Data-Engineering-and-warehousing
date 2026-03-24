@@ -23,8 +23,8 @@ services:
       DB_NAME: de_wh
       DB_USER: de_user
       DB_PASSWORD: de_pass
-      OCCUPAZIONE_CSV: /app/occupazione.csv
-      DISOCCUPAZIONE_CSV: /app/disoccupazione.csv
+      OCCUPAZIONE_CSV: /app/Dataset/occupazione.csv
+      DISOCCUPAZIONE_CSV: /app/Dataset/disoccupazione.csv
     # Run once and exit (the pipeline is idempotent by truncating the target tables).
     restart: "no"
 
